@@ -27,6 +27,13 @@ app = FastAPI(
     version="1.0.0",
 )
 
+
+@app.get("/health")
+@app.get("/healthz")
+async def health_check() -> dict[str, str]:
+    """Standard health check endpoint."""
+    return {"status": "ok", "station": "pe_reversing", "tier": "L4"}
+
 _PIPELINE = StaticTriagePipeline()
 
 

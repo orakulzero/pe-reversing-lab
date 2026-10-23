@@ -2,7 +2,8 @@
   "mcpServers": {
     "pe-reversing-lab-mcp": {
       "command": "python",
-      "args": ["-m", "pe_reversing_lab.cli", "triage", "--profile", "packed_injector", "--json"],
+      "args": ["-m", "pe_reversing_lab.cli", "triage", "--profile", "clean", "--json"],
+      "timeout_ms": 15000,
       "tools": [
         "pe_reversing_lab_triage_binary",
         "pe_reversing_lab_generate_yara"
