@@ -1,0 +1,12 @@
+{
+  "name": "pe-reversing-lab",
+  "displayName": "PE Reversing Lab & YARA Studio",
+  "description": "Static PE32+ x86_64 reverse engineering, section Shannon entropy scanner, IAT anti-debug & injection capability triage, and YARA rule synthesizer.",
+  "version": "1.0.0",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "Triage a PE32+ x86_64 binary for anti-debug and injection APIs",
+    "Scan PE section Shannon entropy for packed segments",
+    "Generate a YARA signature rule from static PE indicators"
+  ]
+}
