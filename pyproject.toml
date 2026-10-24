@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pe-reversing-lab"
-version = "1.0.0"
+version = "1.1.0"
 description = "4-Tier (L1 -> L2 -> L3 -> L4) Static PE32+ x86_64 Reverse Engineering, Section Entropy, IAT Anti-Debug Triage & YARA Rule Studio"
 readme = "README.md"
 license = { text = "MIT" }

@@ -130,7 +130,21 @@ class StaticTriagePipeline:
         stages_completed.append("STAGE_3_IAT_CAPABILITY_TRIAGE")
 
         # Stage 4: YARA Rule & Disassembly Synthesis
-        raw_score = api_weights + (25 if parsed["packed"] else 10)
+        rich_info = parsed.get("rich_header", {})
+        rich_hash = rich_info.get("rich_hash") or None
+        tls_info = parsed.get("tls", {})
+        has_tls = tls_info.get("callback_count", 0) > 0
+        overlay_info = parsed.get("overlay", {})
+        has_overlay = overlay_info.get("present", False)
+        rwx_info = parsed.get("rwx_anomaly", {})
+        has_rwx = rwx_info.get("has_rwx", False)
+
+        raw_score = (
+            api_weights
+            + (25 if parsed["packed"] else 10)
+            + (15 if has_rwx else 0)
+            + (10 if has_overlay else 0)
+        )
         threat_score = min(100, max(5, int(raw_score)))
         yara_text = generate_yara_rule(
             rule_name=f"pe64_{profile}_{parsed['sha256'][:8]}",
@@ -138,6 +152,10 @@ class StaticTriagePipeline:
             suspicious_apis=parsed["suspicious_apis"],
             packed=parsed["packed"],
             score=threat_score,
+            rich_hash=rich_hash,
+            has_tls_callbacks=has_tls,
+            has_overlay=has_overlay,
+            has_rwx=has_rwx,
         )
         disasm = _build_disassembly_snippet(
             parsed["entry_point_rva"],
@@ -181,6 +199,11 @@ class StaticTriagePipeline:
             "severity": severity,
             "yara_rule": yara_text,
             "disassembly_snippet": disasm,
+            "rich_header": rich_info,
+            "exports": parsed.get("exports", {}),
+            "tls": tls_info,
+            "overlay": overlay_info,
+            "rwx_anomaly": rwx_info,
             "seal_sha256": seal_sha256,
             "triaged_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         }
