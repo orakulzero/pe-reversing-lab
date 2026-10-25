@@ -273,7 +273,7 @@ def test_l4_api_catalog() -> None:
     payload = resp.json()
     assert payload["api_count"] >= 10
     assert "suspicious_apis" in payload and len(payload["suspicious_apis"]) >= 10
-    assert payload["profiles"] == ["clean", "anti_debug", "packed_injector"]
+    assert payload["profiles"] == ["clean", "anti_debug", "packed_injector", "syscall_evader"]
     assert payload["entropy_packed_threshold"] == 7.0
 
 
@@ -373,7 +373,7 @@ def test_req005_oss_hygiene_and_zero_cyrillic_or_pii() -> None:
         ("kuro" + "ora" + "kul" + "grey").lower(),
     ]
 
-    skip_dirs = {".git", "__pycache__", ".pytest_cache", ".venv", "venv", "node_modules"}
+    skip_dirs = {".git", "__pycache__", ".pytest_cache", ".hypothesis", ".venv", "venv", "node_modules"}
     for file_path in REPO_ROOT.rglob("*"):
         if not file_path.is_file():
             continue
@@ -387,3 +387,328 @@ def test_req005_oss_hygiene_and_zero_cyrillic_or_pii() -> None:
         lower_text = text.lower()
         for token in forbidden_tokens:
             assert token not in lower_text, f"Forbidden token found in {file_path}"
+
+
+# ============================================================================
+# REQ-R1: Tier L1..L4 v1.2.0 - Prologue Disassembler, Syscall Stub Detector & Xref Graph
+# ============================================================================
+
+from hypothesis import given, strategies as st
+
+
+def test_v1_2_disasm_stack_setup_teardown() -> None:
+    from pe_reversing_lab.l1_primitives import disassemble_x64_prologue
+
+    # sub rsp, 0x28 (48 83 ec 28)
+    # mov [rsp+0x8], rbx (48 89 5c 24 08)
+    # mov rbp, rsp (48 89 e5)
+    # mov rsp, rbp (48 89 ec)
+    # add rsp, 0x28 (48 83 c4 28)
+    # ret (c3)
+    stream = bytes.fromhex("48 83 ec 28 48 89 5c 24 08 48 89 e5 48 89 ec 48 83 c4 28 c3")
+    insns = disassemble_x64_prologue(stream, base_rva=0x1000)
+    assert len(insns) == 6
+    assert insns[0]["mnemonic"] == "sub"
+    assert "rsp, 0x28" in insns[0]["operands"]
+    assert insns[0]["length"] == 4
+    assert insns[1]["mnemonic"] == "mov"
+    assert "rbx" in insns[1]["operands"]
+    assert insns[2]["mnemonic"] == "mov"
+    assert "rbp, rsp" in insns[2]["operands"]
+    assert insns[3]["mnemonic"] == "mov"
+    assert "rsp, rbp" in insns[3]["operands"]
+    assert insns[4]["mnemonic"] == "add"
+    assert "rsp, 0x28" in insns[4]["operands"]
+    assert insns[5]["mnemonic"] == "ret"
+
+
+def test_v1_2_disasm_register_saves() -> None:
+    from pe_reversing_lab.l1_primitives import disassemble_x64_prologue
+
+    # push/pop rax..rdi
+    stream = bytes(range(0x50, 0x60))
+    insns = disassemble_x64_prologue(stream, base_rva=0x2000, max_instructions=32)
+    assert len(insns) == 16
+    for i in range(8):
+        assert insns[i]["mnemonic"] == "push"
+        assert insns[i + 8]["mnemonic"] == "pop"
+
+    # push/pop r8..r15
+    ext_stream = bytearray()
+    for b in range(0x50, 0x60):
+        ext_stream.extend([0x41, b])
+    ext_insns = disassemble_x64_prologue(bytes(ext_stream), base_rva=0x3000, max_instructions=32)
+    assert len(ext_insns) == 16
+    assert ext_insns[0]["operands"] == "r8"
+    assert ext_insns[7]["operands"] == "r15"
+    assert ext_insns[8]["operands"] == "r8"
+    assert ext_insns[15]["operands"] == "r15"
+
+
+def test_v1_2_disasm_syscall_setup() -> None:
+    from pe_reversing_lab.l1_primitives import disassemble_x64_prologue
+
+    stream = bytes.fromhex("4c 8b d1 b8 18 00 00 00 f6 04 25 08 03 fe 7f 01 0f 05 c3 cd 2e c3")
+    insns = disassemble_x64_prologue(stream, base_rva=0x162040, stop_on_ret=False)
+    assert len(insns) == 7
+    assert insns[0]["mnemonic"] == "mov"
+    assert insns[0]["operands"] == "r10, rcx"
+    assert insns[1]["mnemonic"] == "mov"
+    assert "0x18" in insns[1]["operands"]
+    assert insns[2]["mnemonic"] == "test"
+    assert insns[3]["mnemonic"] == "syscall"
+    assert insns[4]["mnemonic"] == "ret"
+    assert insns[5]["mnemonic"] == "int"
+    assert insns[5]["operands"] == "0x2e"
+
+
+def test_v1_2_disasm_rip_relative_calls_jumps() -> None:
+    from pe_reversing_lab.l1_primitives import disassemble_x64_prologue
+
+    # call [rip + 0x1000] and jmp [rip - 0x100]
+    stream = b"\xff\x15\x00\x10\x00\x00\xff\x25\x00\xff\xff\xff"
+    insns = disassemble_x64_prologue(stream, base_rva=0x1000)
+    assert len(insns) == 2
+    assert insns[0]["mnemonic"] == "call"
+    assert insns[0]["target_rva"] == 0x1000 + 6 + 0x1000
+    assert insns[0]["target_rva_hex"] == hex(0x2006)
+    assert insns[1]["mnemonic"] == "jmp"
+    assert insns[1]["target_rva"] == (0x1000 + 6) + 6 - 256
+
+
+def test_v1_2_disasm_relative_branches() -> None:
+    from pe_reversing_lab.l1_primitives import disassemble_x64_prologue
+
+    # call rel32, jmp rel32, jmp rel8, jz rel8, jnz rel8
+    stream = bytes.fromhex("e8 20 00 00 00 e9 30 00 00 00 eb 10 74 08 75 f0")
+    insns = disassemble_x64_prologue(stream, base_rva=0x5000)
+    assert len(insns) == 5
+    assert insns[0]["mnemonic"] == "call"
+    assert insns[0]["target_rva"] == 0x5000 + 5 + 0x20
+    assert insns[1]["mnemonic"] == "jmp"
+    assert insns[1]["target_rva"] == 0x5005 + 5 + 0x30
+    assert insns[2]["mnemonic"] == "jmp"
+    assert insns[2]["target_rva"] == 0x500A + 2 + 0x10
+    assert insns[3]["mnemonic"] == "jz"
+    assert insns[3]["target_rva"] == 0x500C + 2 + 0x08
+    assert insns[4]["mnemonic"] == "jnz"
+    assert insns[4]["target_rva"] == 0x500E + 2 - 16
+
+
+def test_v1_2_disasm_zeroing_nops_ret_int3() -> None:
+    from pe_reversing_lab.l1_primitives import disassemble_x64_prologue
+
+    stream = bytes.fromhex("31 c0 48 31 c0 90 0f 1f 44 00 00 cc c2 08 00")
+    insns = disassemble_x64_prologue(stream, base_rva=0x1000)
+    assert len(insns) == 6
+    assert insns[0]["mnemonic"] == "xor"
+    assert insns[0]["operands"] == "eax, eax"
+    assert insns[1]["mnemonic"] == "xor"
+    assert insns[1]["operands"] == "rax, rax"
+    assert insns[2]["mnemonic"] == "nop"
+    assert insns[3]["mnemonic"] == "nop"
+    assert insns[3]["length"] == 5
+    assert insns[4]["mnemonic"] == "int3"
+    assert insns[5]["mnemonic"] == "ret"
+    assert insns[5]["operands"] == "0x8"
+
+
+def test_v1_2_disasm_real_notepad_entry_point() -> None:
+    from pe_reversing_lab.l1_primitives import disassemble_x64_prologue, parse_pe64_binary
+
+    notepad_path = Path("C:/Windows/System32/notepad.exe")
+    if not notepad_path.exists():
+        pytest.skip("notepad.exe not available on host")
+    raw = notepad_path.read_bytes()
+    parsed = parse_pe64_binary(raw)
+    ep_rva = parsed["entry_point_rva"]
+    chunk = raw[:64]
+    for sec in parsed["sections"]:
+        va = sec["virtual_address"]
+        sz = max(sec["virtual_size"], sec["raw_size"])
+        if va <= ep_rva < va + sz:
+            ptr = sec["raw_ptr"]
+            chunk = raw[ptr + (ep_rva - va) : ptr + (ep_rva - va) + 64]
+            break
+    insns = disassemble_x64_prologue(chunk, base_rva=ep_rva, stop_on_ret=False)
+    assert len(insns) >= 4
+    mnemonics = {i["mnemonic"] for i in insns}
+    assert "sub" in mnemonics
+    assert "call" in mnemonics or "jmp" in mnemonics
+
+
+@given(st.binary(max_size=512))
+def test_v1_2_disasm_hypothesis_fuzzing(data: bytes) -> None:
+    from pe_reversing_lab.l1_primitives import disassemble_x64_prologue
+
+    insns = disassemble_x64_prologue(data, base_rva=0x1000, max_instructions=32)
+    assert isinstance(insns, list)
+    for insn in insns:
+        assert "mnemonic" in insn
+        assert "rva" in insn
+        assert "length" in insn
+        assert insn["length"] >= 1
+
+
+def test_v1_2_detect_syscall_stubs_hells_gate() -> None:
+    from pe_reversing_lab.l1_primitives import detect_syscall_stubs, synthesize_pe64_sample
+
+    sample = synthesize_pe64_sample(inject_syscall_stub=True)
+    res = detect_syscall_stubs(sample)
+    assert res["has_direct_syscalls"] is True
+    assert res["stubs_detected"] >= 1
+    assert any(s["ssn"] == 24 for s in res["direct_stubs"])
+    assert res["has_indirect_gadgets"] is True
+
+
+def test_v1_2_detect_syscall_stubs_hooked_byte0() -> None:
+    from pe_reversing_lab.l1_primitives import (
+        detect_syscall_stubs,
+        parse_pe64_binary,
+        synthesize_pe64_sample,
+    )
+
+    sample = synthesize_pe64_sample(with_export_table=True)
+    pe = parse_pe64_binary(sample)
+    sec0_ptr = pe["sections"][0]["raw_ptr"]
+    mutable = bytearray(sample)
+    # Overwrite entry point in section 0 (.text)
+    mutable[sec0_ptr : sec0_ptr + 5] = b"\xe9\x00\x10\x00\x00"
+    res = detect_syscall_stubs(bytes(mutable))
+    assert res["has_hooked_syscalls"] is True
+    assert len(res["hooked_stubs"]) >= 1
+    assert res["hooked_stubs"][0]["stub_type"] == "hooked_byte0"
+    assert res["hooked_stubs"][0]["hook_offset"] == 0
+
+
+def test_v1_2_detect_syscall_stubs_hooked_byte3() -> None:
+    from pe_reversing_lab.l1_primitives import (
+        detect_syscall_stubs,
+        parse_pe64_binary,
+        synthesize_pe64_sample,
+    )
+
+    sample = synthesize_pe64_sample(with_export_table=True)
+    pe = parse_pe64_binary(sample)
+    sec0_ptr = pe["sections"][0]["raw_ptr"]
+    mutable = bytearray(sample)
+    mutable[sec0_ptr : sec0_ptr + 8] = b"\x4c\x8b\xd1\xe9\x00\x10\x00\x00"
+    res = detect_syscall_stubs(bytes(mutable))
+    assert res["has_hooked_syscalls"] is True
+    assert len(res["hooked_stubs"]) >= 1
+    assert res["hooked_stubs"][0]["stub_type"] == "hooked_byte3"
+    assert res["hooked_stubs"][0]["hook_offset"] == 3
+
+
+def test_v1_2_detect_syscall_stubs_standalone_gadgets() -> None:
+    from pe_reversing_lab.l1_primitives import detect_syscall_stubs, synthesize_pe64_sample
+
+    sample = synthesize_pe64_sample()
+    mutable = bytearray(sample)
+    mutable[0x420 : 0x423] = b"\x0f\x05\xc3"
+    res = detect_syscall_stubs(bytes(mutable))
+    assert res["has_indirect_gadgets"] is True
+    assert any(g["bytes"] == "0f 05 c3" for g in res["indirect_gadgets"])
+
+
+def test_v1_2_detect_syscall_stubs_live_ntdll() -> None:
+    from pe_reversing_lab.l1_primitives import detect_syscall_stubs
+
+    ntdll_path = Path("C:/Windows/System32/ntdll.dll")
+    if not ntdll_path.exists():
+        pytest.skip("ntdll.dll not available on host")
+    data = ntdll_path.read_bytes()
+    res = detect_syscall_stubs(data)
+    assert res["has_direct_syscalls"] is True
+    assert len(res["direct_stubs"]) >= 400
+    ssn_by_symbol = {s["symbol"]: s["ssn"] for s in res["direct_stubs"]}
+    assert "NtAccessCheck" in ssn_by_symbol
+    assert ssn_by_symbol["NtAccessCheck"] == 0
+    assert "NtAllocateVirtualMemory" in ssn_by_symbol
+    assert ssn_by_symbol["NtAllocateVirtualMemory"] == 24
+    assert len(res["indirect_gadgets"]) >= 400
+
+
+@given(st.binary(max_size=1024))
+def test_v1_2_detect_syscall_hypothesis_fuzzing(data: bytes) -> None:
+    from pe_reversing_lab.l1_primitives import detect_syscall_stubs
+
+    res = detect_syscall_stubs(data)
+    assert isinstance(res, dict)
+    assert "direct_stubs" in res
+    assert "hooked_stubs" in res
+    assert "indirect_gadgets" in res
+
+
+def test_v1_2_build_iat_eat_xref_graph_synthetic() -> None:
+    from pe_reversing_lab.l1_primitives import build_iat_eat_xref_graph, synthesize_pe64_sample
+
+    sample = synthesize_pe64_sample(with_export_table=True)
+    graph = build_iat_eat_xref_graph(sample)
+    assert isinstance(graph, dict)
+    assert "nodes" in graph
+    assert "edges" in graph
+    assert graph["eat_export_count"] >= 1
+    assert any(e["symbol"] == "SampleExportedFn" for e in graph["edges"])
+    assert graph["total_xrefs"] >= 1
+
+
+def test_v1_2_build_iat_eat_xref_graph_live_targets() -> None:
+    from pe_reversing_lab.l1_primitives import build_iat_eat_xref_graph
+
+    notepad_path = Path("C:/Windows/System32/notepad.exe")
+    if notepad_path.exists():
+        data = notepad_path.read_bytes()
+        graph = build_iat_eat_xref_graph(data)
+        assert graph["iat_xref_count"] > 100
+        assert len(graph["nodes"]) > 10
+        assert len(graph["edges"]) > 100
+    kernel32_path = Path("C:/Windows/System32/kernel32.dll")
+    if kernel32_path.exists():
+        data = kernel32_path.read_bytes()
+        graph = build_iat_eat_xref_graph(data)
+        assert graph["eat_export_count"] > 50
+
+
+def test_v1_2_pipeline_syscall_evader_profile() -> None:
+    from pe_reversing_lab.l3_pipeline import StaticTriagePipeline
+
+    pipeline = StaticTriagePipeline()
+    res = pipeline.triage_sample(profile="syscall_evader")
+    assert res["ok"] is True
+    assert res["profile"] == "syscall_evader"
+    assert "prologue_instructions" in res
+    assert len(res["prologue_instructions"]) > 0
+    assert "syscall_analysis" in res
+    assert res["syscall_analysis"]["has_direct_syscalls"] is True
+    assert "xref_graph" in res
+    assert res["threat_score"] >= 30
+
+
+def test_v1_2_l4_app_endpoints_and_metadata() -> None:
+    from pe_reversing_lab import __version__
+    from pe_reversing_lab.l4_app import app
+
+    client = TestClient(app)
+    # Test disassemble endpoint
+    dis_res = client.post("/api/pe/disassemble", json={"raw_hex": "4883ec2890c3"})
+    assert dis_res.status_code == 200
+    dis_data = dis_res.json()
+    assert dis_data["ok"] is True
+    assert dis_data["instruction_count"] == 3
+
+    # Test syscalls endpoint
+    sys_res = client.post("/api/pe/syscalls", json={"profile": "syscall_evader"})
+    assert sys_res.status_code == 200
+    sys_data = sys_res.json()
+    assert sys_data["ok"] is True
+    assert sys_data["syscall_analysis"]["has_direct_syscalls"] is True
+
+    # Test metadata versions
+    assert app.version == "1.2.0"
+    assert __version__ == "1.2.0"
+    pyproject_text = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    assert 'version = "1.2.0"' in pyproject_text
+    plugin_text = (REPO_ROOT / "plugins" / "pe-reversing-lab" / "plugin.json").read_text(encoding="utf-8")
+    assert '"version": "1.2.0"' in plugin_text
+

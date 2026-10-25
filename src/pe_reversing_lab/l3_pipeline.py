@@ -12,6 +12,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from pe_reversing_lab.l1_primitives import (
     SUSPICIOUS_API_CATALOG,
+    build_iat_eat_xref_graph,
+    detect_syscall_stubs,
+    disassemble_x64_prologue,
     generate_yara_rule,
     parse_pe64_binary,
     synthesize_pe64_sample,
@@ -50,6 +53,12 @@ SAMPLE_PROFILES: Dict[str, Dict[str, Any]] = {
             "CreateRemoteThread",
         ),
         "high_entropy_section": True,
+    },
+    "syscall_evader": {
+        "section_names": (".text", ".rdata"),
+        "imports": ("VirtualAlloc", "VirtualProtect"),
+        "high_entropy_section": False,
+        "inject_syscall_stub": True,
     },
 }
 
@@ -111,6 +120,7 @@ class StaticTriagePipeline:
                 section_names=cfg["section_names"],
                 imports=cfg["imports"],
                 high_entropy_section=cfg["high_entropy_section"],
+                inject_syscall_stub=cfg.get("inject_syscall_stub", False),
             )
 
         # Stage 1: Parse PE32+ Header
@@ -129,7 +139,7 @@ class StaticTriagePipeline:
         )
         stages_completed.append("STAGE_3_IAT_CAPABILITY_TRIAGE")
 
-        # Stage 4: YARA Rule & Disassembly Synthesis
+        # Stage 4: YARA Rule, Prologue Disassembly, Syscalls & Xref Graph Synthesis
         rich_info = parsed.get("rich_header", {})
         rich_hash = rich_info.get("rich_hash") or None
         tls_info = parsed.get("tls", {})
@@ -139,11 +149,24 @@ class StaticTriagePipeline:
         rwx_info = parsed.get("rwx_anomaly", {})
         has_rwx = rwx_info.get("has_rwx", False)
 
+        prologue_instructions = disassemble_x64_prologue(
+            raw_bytes,
+            base_rva=parsed["entry_point_rva"],
+        )
+        syscall_analysis = detect_syscall_stubs(raw_bytes, parsed_pe=parsed)
+        xref_graph = build_iat_eat_xref_graph(raw_bytes, parsed_pe=parsed)
+
+        has_syscalls = bool(
+            syscall_analysis.get("has_direct_syscalls")
+            or syscall_analysis.get("has_hooked_syscalls")
+        )
+
         raw_score = (
             api_weights
             + (25 if parsed["packed"] else 10)
             + (15 if has_rwx else 0)
             + (10 if has_overlay else 0)
+            + (20 if has_syscalls else 0)
         )
         threat_score = min(100, max(5, int(raw_score)))
         yara_text = generate_yara_rule(
@@ -199,6 +222,9 @@ class StaticTriagePipeline:
             "severity": severity,
             "yara_rule": yara_text,
             "disassembly_snippet": disasm,
+            "prologue_instructions": prologue_instructions,
+            "syscall_analysis": syscall_analysis,
+            "xref_graph": xref_graph,
             "rich_header": rich_info,
             "exports": parsed.get("exports", {}),
             "tls": tls_info,

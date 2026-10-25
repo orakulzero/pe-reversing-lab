@@ -18,13 +18,17 @@ from pydantic import BaseModel
 
 from pe_reversing_lab.l1_primitives import (
     SUSPICIOUS_API_CATALOG,
+    detect_syscall_stubs,
+    disassemble_x64_prologue,
     generate_yara_rule,
+    parse_pe64_binary,
+    synthesize_pe64_sample,
 )
 from pe_reversing_lab.l3_pipeline import SAMPLE_PROFILES, StaticTriagePipeline
 
 app = FastAPI(
     title="PE Reversing Lab L4 — Static PE32+ x86_64 Triage & YARA Studio",
-    version="1.0.0",
+    version="1.2.0",
 )
 
 
@@ -53,6 +57,21 @@ class ReportToRootRequest(BaseModel):
     profile: str = "packed_injector"
     root_dir: Optional[str] = None
     summary: Optional[str] = None
+
+
+class DisassembleRequest(BaseModel):
+    profile: Optional[str] = None
+    raw_hex: Optional[str] = None
+    base_rva: int = 0x1000
+    max_instructions: int = 32
+    max_bytes: int = 128
+    stop_on_ret: bool = True
+
+
+class SyscallScanRequest(BaseModel):
+    profile: Optional[str] = None
+    raw_hex: Optional[str] = None
+    target_path: Optional[str] = None
 
 
 def _render_workstation_html() -> str:
@@ -104,6 +123,7 @@ def _render_workstation_html() -> str:
           <option value="packed_injector">packed_injector (.upx1 8.0-bit entropy + VirtualAllocEx + IsDebuggerPresent)</option>
           <option value="anti_debug">anti_debug (IsDebuggerPresent + CheckRemoteDebuggerPresent + NtQueryInformationProcess)</option>
           <option value="clean">clean (Standard PE32+ .text/.rdata/.data binary)</option>
+          <option value="syscall_evader">syscall_evader (Direct Hell's Gate syscall stub + VirtualAlloc/VirtualProtect)</option>
         </select>
       </div>
       <div class="flex items-end">
@@ -263,3 +283,91 @@ async def report_to_root_endpoint(req: ReportToRootRequest) -> Dict[str, Any]:
         "markdown_path": str(md_path),
         "triage": triage,
     }
+
+
+@app.post("/api/pe/disassemble")
+async def disassemble_pe_endpoint(req: DisassembleRequest) -> Dict[str, Any]:
+    """Disassemble function prologue or raw instruction bytes."""
+    try:
+        if req.raw_hex:
+            raw_bytes = bytes.fromhex(req.raw_hex.replace(" ", ""))
+        elif req.profile:
+            prof = req.profile.strip()
+            if prof not in SAMPLE_PROFILES:
+                raise ValueError(f"Unknown profile '{prof}'. Allowed: {list(SAMPLE_PROFILES.keys())}")
+            cfg = SAMPLE_PROFILES[prof]
+            raw_pe = synthesize_pe64_sample(
+                section_names=cfg["section_names"],
+                imports=cfg["imports"],
+                high_entropy_section=cfg["high_entropy_section"],
+                inject_syscall_stub=cfg.get("inject_syscall_stub", False),
+            )
+            parsed = parse_pe64_binary(raw_pe)
+            ep_rva = parsed["entry_point_rva"]
+            raw_bytes = b""
+            for sec in parsed["sections"]:
+                va = sec["virtual_address"]
+                sz = max(sec["virtual_size"], sec["raw_size"])
+                if va <= ep_rva < va + sz:
+                    ptr = sec["raw_ptr"]
+                    raw_bytes = raw_pe[ptr + (ep_rva - va) : ptr + (ep_rva - va) + req.max_bytes]
+                    break
+            if not raw_bytes:
+                raw_bytes = raw_pe[:req.max_bytes]
+        else:
+            raw_bytes = b"\x48\x83\xec\x28\x90\x48\x83\xc4\x28\xc3"
+
+        instructions = disassemble_x64_prologue(
+            raw_bytes,
+            base_rva=req.base_rva,
+            max_instructions=req.max_instructions,
+            max_bytes=req.max_bytes,
+            stop_on_ret=req.stop_on_ret,
+        )
+        return {
+            "ok": True,
+            "instruction_count": len(instructions),
+            "instructions": instructions,
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/pe/syscalls")
+async def scan_syscalls_endpoint(req: SyscallScanRequest) -> Dict[str, Any]:
+    """Scan executable sections and export tables for direct, hooked, or indirect syscall stubs."""
+    try:
+        if req.target_path:
+            p = Path(req.target_path).resolve()
+            if not p.is_file():
+                raise ValueError(f"Target path '{req.target_path}' not found")
+            raw_bytes = p.read_bytes()
+        elif req.raw_hex:
+            raw_bytes = bytes.fromhex(req.raw_hex.replace(" ", ""))
+        elif req.profile:
+            prof = req.profile.strip()
+            if prof not in SAMPLE_PROFILES:
+                raise ValueError(f"Unknown profile '{prof}'. Allowed: {list(SAMPLE_PROFILES.keys())}")
+            cfg = SAMPLE_PROFILES[prof]
+            raw_bytes = synthesize_pe64_sample(
+                section_names=cfg["section_names"],
+                imports=cfg["imports"],
+                high_entropy_section=cfg["high_entropy_section"],
+                inject_syscall_stub=cfg.get("inject_syscall_stub", False),
+            )
+        else:
+            cfg = SAMPLE_PROFILES["syscall_evader"]
+            raw_bytes = synthesize_pe64_sample(
+                section_names=cfg["section_names"],
+                imports=cfg["imports"],
+                high_entropy_section=cfg["high_entropy_section"],
+                inject_syscall_stub=cfg.get("inject_syscall_stub", False),
+            )
+
+        analysis = detect_syscall_stubs(raw_bytes)
+        return {
+            "ok": True,
+            "syscall_analysis": analysis,
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
