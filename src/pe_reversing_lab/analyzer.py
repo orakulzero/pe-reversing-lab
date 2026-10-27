@@ -1353,3 +1353,415 @@ def analyze_pe_cfg_and_trampolines(
         "entry_point_rva": entry_point_rva,
         "valid": True,
     }
+
+
+def analyze_pe_security_and_unwind(
+    pe_path_or_bytes: Union[str, bytes, Path],
+) -> Dict[str, Any]:
+    """Tier L4 Authenticode WIN_CERTIFICATE, EAT Export Forwarding & .pdata x64 Exception Unwind (v2.0.0).
+
+    Parses:
+    1. Authenticode Certificate Table (IMAGE_DIRECTORY_ENTRY_SECURITY) structures and overlay tamper detection.
+    2. Export Address Table (EAT) forwarder RVAs and target symbol resolution.
+    3. x64 Exception Directory (.pdata) RUNTIME_FUNCTION array and UNWIND_INFO / UNWIND_CODE hierarchy.
+    """
+    raw_bytes = _load_pe_bytes(pe_path_or_bytes)
+    if raw_bytes is None or len(raw_bytes) < 0x40:
+        return {
+            "valid": False,
+            "error": "Failed to load PE bytes or file too small",
+            "security": {"present": False, "authenticode": {"present": False}},
+            "authenticode": {"present": False, "certificates": []},
+            "overlay_tamper": {"tamper_detected": False, "overlay_present": False, "unverified_bytes": 0},
+            "eat_forwarders": {"present": False, "total_exports": 0, "forwarded_count": 0, "forwarders": []},
+            "pdata_unwind": {"present": False, "function_count": 0, "runtime_functions": []},
+        }
+
+    if raw_bytes[:2] != b"MZ":
+        return {
+            "valid": False,
+            "error": "Invalid DOS MZ magic header",
+            "security": {"present": False, "authenticode": {"present": False}},
+            "authenticode": {"present": False, "certificates": []},
+            "overlay_tamper": {"tamper_detected": False, "overlay_present": False, "unverified_bytes": 0},
+            "eat_forwarders": {"present": False, "total_exports": 0, "forwarded_count": 0, "forwarders": []},
+            "pdata_unwind": {"present": False, "function_count": 0, "runtime_functions": []},
+        }
+
+    file_size = len(raw_bytes)
+    e_lfanew = struct.unpack_from("<I", raw_bytes, 0x3C)[0]
+    if e_lfanew + 24 > file_size or raw_bytes[e_lfanew : e_lfanew + 4] != b"PE\x00\x00":
+        return {
+            "valid": False,
+            "error": "Invalid PE NT signature",
+            "security": {"present": False, "authenticode": {"present": False}},
+            "authenticode": {"present": False, "certificates": []},
+            "overlay_tamper": {"tamper_detected": False, "overlay_present": False, "unverified_bytes": 0},
+            "eat_forwarders": {"present": False, "total_exports": 0, "forwarded_count": 0, "forwarders": []},
+            "pdata_unwind": {"present": False, "function_count": 0, "runtime_functions": []},
+        }
+
+    machine, num_sections, timedatestamp, _, _, size_of_opt_hdr, characteristics = struct.unpack_from(
+        "<HHIIIHH", raw_bytes, e_lfanew + 4
+    )
+    opt_off = e_lfanew + 24
+    if opt_off + size_of_opt_hdr > file_size or size_of_opt_hdr < 2:
+        return {
+            "valid": False,
+            "error": "Truncated optional header",
+            "security": {"present": False, "authenticode": {"present": False}},
+            "authenticode": {"present": False, "certificates": []},
+            "overlay_tamper": {"tamper_detected": False, "overlay_present": False, "unverified_bytes": 0},
+            "eat_forwarders": {"present": False, "total_exports": 0, "forwarded_count": 0, "forwarders": []},
+            "pdata_unwind": {"present": False, "function_count": 0, "runtime_functions": []},
+        }
+
+    opt_magic = struct.unpack_from("<H", raw_bytes, opt_off)[0]
+    is_pe64 = (opt_magic == 0x020B)
+    dd_base = opt_off + (112 if is_pe64 else 96)
+    num_dd_off = opt_off + (108 if is_pe64 else 92)
+    raw_num_dd = struct.unpack_from("<I", raw_bytes, num_dd_off)[0] if num_dd_off + 4 <= file_size else 16
+    if raw_num_dd == 0 and size_of_opt_hdr >= ((112 if is_pe64 else 96) + 8):
+        num_dd = min(16, (size_of_opt_hdr - (112 if is_pe64 else 96)) // 8)
+    else:
+        num_dd = min(raw_num_dd if raw_num_dd > 0 else 16, 16)
+
+    # Parse Section Headers
+    sec_headers_off = opt_off + size_of_opt_hdr
+    sections: List[Dict[str, Any]] = []
+    for s_idx in range(num_sections):
+        sh_off = sec_headers_off + s_idx * 40
+        if sh_off + 40 > file_size:
+            break
+        s_name_raw, v_size, v_addr, r_size, r_ptr, _, _, _, _, s_chars = struct.unpack_from(
+            "<8sIIIIIIHHI", raw_bytes, sh_off
+        )
+        sec_name = s_name_raw.split(b"\x00", 1)[0].decode("latin-1", errors="replace")
+        sections.append({
+            "name": sec_name,
+            "virtual_size": v_size,
+            "virtual_address": v_addr,
+            "raw_size": r_size,
+            "raw_ptr": r_ptr,
+            "characteristics": s_chars,
+        })
+
+    def rva_to_offset(rva: int) -> Optional[int]:
+        for sec in sections:
+            va = sec["virtual_address"]
+            span = max(sec["virtual_size"], sec["raw_size"])
+            if va <= rva < va + span:
+                return sec["raw_ptr"] + (rva - va)
+        return None
+
+    max_section_end = max((sec["raw_ptr"] + sec["raw_size"]) for sec in sections) if sections else 0
+
+    # ------------------------------------------------------------------------
+    # 1. Authenticode Certificate Table & Overlay Tamper Analysis
+    # ------------------------------------------------------------------------
+    sec_dir_file_off, sec_dir_size = 0, 0
+    if num_dd > 4 and dd_base + 4 * 8 + 8 <= file_size:
+        sec_dir_file_off, sec_dir_size = struct.unpack_from("<II", raw_bytes, dd_base + 4 * 8)
+
+    certificates: List[Dict[str, Any]] = []
+    if sec_dir_file_off != 0 and sec_dir_size > 0:
+        curr_off = sec_dir_file_off
+        end_off = min(sec_dir_file_off + sec_dir_size, file_size)
+        while curr_off + 8 <= end_off:
+            dw_len, w_rev, w_type = struct.unpack_from("<IHH", raw_bytes, curr_off)
+            if dw_len < 8 or curr_off + dw_len > file_size:
+                break
+            cert_blob = raw_bytes[curr_off + 8 : curr_off + dw_len]
+            cert_sha = hashlib.sha256(cert_blob).hexdigest()
+            certificates.append({
+                "dwLength": dw_len,
+                "wRevision": w_rev,
+                "wRevision_hex": hex(w_rev),
+                "wCertificateType": w_type,
+                "wCertificateType_hex": hex(w_type),
+                "certificate_type_name": (
+                    "WIN_CERT_TYPE_PKCS_SIGNED_DATA" if w_type == 2
+                    else "WIN_CERT_TYPE_X509" if w_type == 1
+                    else f"WIN_CERT_TYPE_{w_type}"
+                ),
+                "is_pkcs7": (w_type == 2),
+                "blob_size": len(cert_blob),
+                "sha256": cert_sha,
+                "offset": curr_off,
+            })
+            curr_off += (dw_len + 7) & ~7
+
+        primary_cert = certificates[0] if certificates else None
+        authenticode_info = {
+            "present": True,
+            "security_directory_offset": sec_dir_file_off,
+            "security_directory_size": sec_dir_size,
+            "certificate_count": len(certificates),
+            "certificates": certificates,
+            "dwLength": primary_cert["dwLength"] if primary_cert else 0,
+            "wRevision": primary_cert["wRevision"] if primary_cert else 0,
+            "wCertificateType": primary_cert["wCertificateType"] if primary_cert else 0,
+            "sha256": primary_cert["sha256"] if primary_cert else "",
+        }
+
+        unverified_overlay = max(0, file_size - (sec_dir_file_off + sec_dir_size))
+        tamper_detected = False
+        tamper_reasons: List[str] = []
+        if unverified_overlay > 0:
+            tamper_detected = True
+            tamper_reasons.append(f"Unverified trailing overlay of {unverified_overlay} bytes after certificate")
+        if sec_dir_file_off < max_section_end:
+            tamper_detected = True
+            tamper_reasons.append(f"Certificate offset {sec_dir_file_off} precedes section end {max_section_end}")
+        if sec_dir_file_off + sec_dir_size > file_size:
+            tamper_detected = True
+            tamper_reasons.append("Certificate table bounds exceed physical file size")
+
+        overlay_tamper_info = {
+            "overlay_present": (file_size > max_section_end),
+            "tamper_detected": tamper_detected,
+            "tamper_reasons": tamper_reasons,
+            "max_section_end": max_section_end,
+            "unverified_bytes": unverified_overlay,
+            "file_size": file_size,
+        }
+    else:
+        authenticode_info = {
+            "present": False,
+            "security_directory_offset": 0,
+            "security_directory_size": 0,
+            "certificate_count": 0,
+            "certificates": [],
+            "dwLength": 0,
+            "wRevision": 0,
+            "wCertificateType": 0,
+            "sha256": "",
+        }
+        raw_overlay_size = max(0, file_size - max_section_end)
+        overlay_tamper_info = {
+            "overlay_present": (raw_overlay_size > 0),
+            "tamper_detected": False,
+            "tamper_reasons": [],
+            "max_section_end": max_section_end,
+            "unverified_bytes": raw_overlay_size,
+            "file_size": file_size,
+        }
+
+    # ------------------------------------------------------------------------
+    # 2. Export Address Table (EAT) Forwarder Parsing
+    # ------------------------------------------------------------------------
+    exp_rva, exp_size = 0, 0
+    if num_dd > 0 and dd_base + 8 <= file_size:
+        exp_rva, exp_size = struct.unpack_from("<II", raw_bytes, dd_base)
+
+    forwarders: List[Dict[str, Any]] = []
+    all_exports: List[Dict[str, Any]] = []
+    num_funcs = 0
+
+    if exp_rva != 0 and exp_size > 0:
+        exp_off = rva_to_offset(exp_rva)
+        if exp_off is not None and exp_off + 40 <= file_size:
+            (
+                _exp_chars, _exp_ts, _maj, _min,
+                name_rva, ord_base, num_funcs, num_names,
+                addr_funcs_rva, addr_names_rva, addr_ords_rva
+            ) = struct.unpack_from("<IIHHIIIIIII", raw_bytes, exp_off)
+
+            funcs_off = rva_to_offset(addr_funcs_rva)
+            names_off = rva_to_offset(addr_names_rva)
+            ords_off = rva_to_offset(addr_ords_rva)
+
+            ord_to_name: Dict[int, str] = {}
+            if names_off is not None and ords_off is not None:
+                for n_idx in range(min(num_names, 20000)):
+                    if names_off + n_idx * 4 + 4 > file_size or ords_off + n_idx * 2 + 2 > file_size:
+                        break
+                    n_rva = struct.unpack_from("<I", raw_bytes, names_off + n_idx * 4)[0]
+                    n_file_off = rva_to_offset(n_rva)
+                    fn_name = ""
+                    if n_file_off is not None and n_file_off < file_size:
+                        fn_name = raw_bytes[n_file_off:].split(b"\x00", 1)[0].decode("ascii", errors="replace")
+                    ord_idx = struct.unpack_from("<H", raw_bytes, ords_off + n_idx * 2)[0]
+                    ord_to_name[ord_idx] = fn_name
+
+            if funcs_off is not None:
+                for f_idx in range(min(num_funcs, 20000)):
+                    if funcs_off + f_idx * 4 + 4 > file_size:
+                        break
+                    f_rva = struct.unpack_from("<I", raw_bytes, funcs_off + f_idx * 4)[0]
+                    fn_name = ord_to_name.get(f_idx, "")
+                    fn_ord = ord_base + f_idx
+                    is_forwarder = (exp_rva <= f_rva < exp_rva + exp_size)
+                    fwd_dict = None
+                    if is_forwarder:
+                        fwd_off = rva_to_offset(f_rva)
+                        if fwd_off is not None and fwd_off < file_size:
+                            fwd_raw = raw_bytes[fwd_off:].split(b"\x00", 1)[0].decode("ascii", errors="replace")
+                            parts = fwd_raw.split(".", 1)
+                            t_dll = parts[0]
+                            t_sym = parts[1] if len(parts) > 1 else ""
+                            is_ord = t_sym.startswith("#")
+                            t_ord = int(t_sym[1:]) if (is_ord and t_sym[1:].isdigit()) else None
+                            fwd_dict = {
+                                "source_name": fn_name,
+                                "source_ordinal": fn_ord,
+                                "rva": hex(f_rva),
+                                "rva_int": f_rva,
+                                "forwarder_string": fwd_raw,
+                                "target_dll": t_dll,
+                                "target_symbol": t_sym,
+                                "is_ordinal": is_ord,
+                                "target_ordinal": t_ord,
+                            }
+                            forwarders.append(fwd_dict)
+
+                    all_exports.append({
+                        "name": fn_name,
+                        "ordinal": fn_ord,
+                        "rva": hex(f_rva),
+                        "is_forwarder": is_forwarder,
+                        "forwarder": fwd_dict,
+                    })
+
+    eat_forwarders_info = {
+        "present": bool(forwarders),
+        "total_exports": num_funcs,
+        "forwarded_count": len(forwarders),
+        "forwarded_ratio": round(len(forwarders) / num_funcs, 4) if num_funcs > 0 else 0.0,
+        "forwarders": forwarders,
+        "all_exports": all_exports,
+        "export_directory_rva": hex(exp_rva),
+        "export_directory_size": exp_size,
+    }
+
+    # ------------------------------------------------------------------------
+    # 3. .pdata x64 Exception Unwind (RUNTIME_FUNCTION / UNWIND_INFO)
+    # ------------------------------------------------------------------------
+    exc_rva, exc_size = 0, 0
+    if num_dd > 3 and dd_base + 3 * 8 + 8 <= file_size:
+        exc_rva, exc_size = struct.unpack_from("<II", raw_bytes, dd_base + 3 * 8)
+
+    runtime_functions: List[Dict[str, Any]] = []
+    if exc_rva != 0 and exc_size >= 12:
+        exc_off = rva_to_offset(exc_rva)
+        if exc_off is not None and exc_off < file_size:
+            num_rf = exc_size // 12
+            for rf_i in range(min(num_rf, 10000)):
+                rf_entry_off = exc_off + rf_i * 12
+                if rf_entry_off + 12 > file_size:
+                    break
+                b_rva, e_rva, ui_rva = struct.unpack_from("<III", raw_bytes, rf_entry_off)
+                uinfo_dict = None
+                ui_off = rva_to_offset(ui_rva)
+                if ui_off is not None and ui_off + 4 <= file_size:
+                    v_and_f = raw_bytes[ui_off]
+                    ver = v_and_f & 0x07
+                    flags = (v_and_f >> 3) & 0x1F
+                    prolog_sz = raw_bytes[ui_off + 1]
+                    cnt_codes = raw_bytes[ui_off + 2]
+                    frame_byte = raw_bytes[ui_off + 3]
+                    frame_reg = frame_byte & 0x0F
+                    frame_off = (frame_byte >> 4) & 0x0F
+
+                    flag_names: List[str] = []
+                    if flags == 0:
+                        flag_names.append("UNW_FLAG_NHANDLER")
+                    if flags & 0x01:
+                        flag_names.append("UNW_FLAG_EHANDLER")
+                    if flags & 0x02:
+                        flag_names.append("UNW_FLAG_UHANDLER")
+                    if flags & 0x04:
+                        flag_names.append("UNW_FLAG_CHAININFO")
+
+                    parsed_codes: List[Dict[str, Any]] = []
+                    codes_base = ui_off + 4
+                    op_names = {
+                        0: "UWOP_PUSH_NONVOL",
+                        1: "UWOP_ALLOC_LARGE",
+                        2: "UWOP_ALLOC_SMALL",
+                        3: "UWOP_SET_FPREG",
+                        4: "UWOP_SAVE_NONVOL",
+                        5: "UWOP_SAVE_NONVOL_FAR",
+                        6: "UWOP_SAVE_XMM128",
+                        7: "UWOP_SAVE_XMM128_FAR",
+                        8: "UWOP_PUSH_MACHFRAME",
+                    }
+                    for c_idx in range(cnt_codes):
+                        c_off = codes_base + c_idx * 2
+                        if c_off + 2 > file_size:
+                            break
+                        c_prolog_off = raw_bytes[c_off]
+                        op_b = raw_bytes[c_off + 1]
+                        op = op_b & 0x0F
+                        op_info = (op_b >> 4) & 0x0F
+                        parsed_codes.append({
+                            "slot_index": c_idx,
+                            "prolog_offset": c_prolog_off,
+                            "unwind_op": op,
+                            "unwind_op_name": op_names.get(op, f"UWOP_UNKNOWN_{op}"),
+                            "op_info": op_info,
+                        })
+
+                    aligned_code_count = (cnt_codes + 1) & ~1
+                    trailer_off = codes_base + aligned_code_count * 2
+                    chained_func = None
+                    exc_handler_rva = None
+
+                    if (flags & 0x04) and trailer_off + 12 <= file_size:
+                        c_b, c_e, c_ui = struct.unpack_from("<III", raw_bytes, trailer_off)
+                        chained_func = {
+                            "begin_rva": hex(c_b),
+                            "end_rva": hex(c_e),
+                            "unwind_info_rva": hex(c_ui),
+                        }
+                    elif (flags & 0x03) and trailer_off + 4 <= file_size:
+                        h_rva = struct.unpack_from("<I", raw_bytes, trailer_off)[0]
+                        exc_handler_rva = hex(h_rva)
+
+                    uinfo_dict = {
+                        "version": ver,
+                        "flags": flags,
+                        "flag_names": flag_names,
+                        "prolog_size": prolog_sz,
+                        "count_of_codes": cnt_codes,
+                        "frame_register": frame_reg,
+                        "frame_offset": frame_off,
+                        "frame_offset_bytes": frame_off * 16,
+                        "unwind_codes": parsed_codes,
+                        "chained_function": chained_func,
+                        "exception_handler_rva": exc_handler_rva,
+                    }
+
+                runtime_functions.append({
+                    "index": rf_i,
+                    "begin_rva": hex(b_rva),
+                    "end_rva": hex(e_rva),
+                    "unwind_info_rva": hex(ui_rva),
+                    "function_size": e_rva - b_rva,
+                    "unwind_info": uinfo_dict,
+                })
+
+    pdata_unwind_info = {
+        "present": bool(runtime_functions),
+        "function_count": len(runtime_functions),
+        "exception_rva": hex(exc_rva),
+        "exception_size": exc_size,
+        "runtime_functions": runtime_functions,
+    }
+
+    return {
+        "format": "PE32+" if is_pe64 else "PE32",
+        "architecture": "x86_64" if is_pe64 else "x86",
+        "sha256": hashlib.sha256(raw_bytes).hexdigest(),
+        "security": {
+            "present": authenticode_info["present"],
+            "authenticode": authenticode_info,
+            "overlay_tamper": overlay_tamper_info,
+        },
+        "authenticode": authenticode_info,
+        "overlay_tamper": overlay_tamper_info,
+        "eat_forwarders": eat_forwarders_info,
+        "pdata_unwind": pdata_unwind_info,
+        "valid": True,
+    }
+
