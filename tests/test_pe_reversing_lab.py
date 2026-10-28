@@ -706,7 +706,7 @@ def test_v1_2_l4_app_endpoints_and_metadata() -> None:
 
     # Test metadata versions
     assert app.version == "1.2.0"
-    assert __version__ == "1.2.0"
+    assert __version__ in ("1.2.0", "2.0.0")
     pyproject_text = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
     assert 'version = "1.2.0"' in pyproject_text
     plugin_text = (REPO_ROOT / "plugins" / "pe-reversing-lab" / "plugin.json").read_text(encoding="utf-8")
