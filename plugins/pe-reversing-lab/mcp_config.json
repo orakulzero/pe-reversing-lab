@@ -2,7 +2,12 @@
   "mcpServers": {
     "pe-reversing-lab-mcp": {
       "command": "python",
-      "args": ["-m", "pe_reversing_lab.cli", "triage", "--profile", "clean", "--json"],
+      "args": [
+        "-W",
+        "ignore::RuntimeWarning",
+        "-m",
+        "pe_reversing_lab.mcp_server"
+      ],
       "timeout_ms": 15000,
       "tools": [
         "pe_reversing_lab_triage_binary",
