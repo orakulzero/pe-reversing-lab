@@ -8,7 +8,7 @@ from __future__ import annotations
 import datetime
 import hashlib
 import json
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 from pe_reversing_lab.l1_primitives import (
     SUSPICIOUS_API_CATALOG,
@@ -20,7 +20,7 @@ from pe_reversing_lab.l1_primitives import (
     synthesize_pe64_sample,
 )
 
-PIPELINE_STAGES: List[str] = [
+PIPELINE_STAGES: list[str] = [
     "STAGE_1_PE64_HEADER_PARSE",
     "STAGE_2_SECTION_ENTROPY_SCAN",
     "STAGE_3_IAT_CAPABILITY_TRIAGE",
@@ -28,7 +28,7 @@ PIPELINE_STAGES: List[str] = [
     "STAGE_5_THREAT_SCORE_SEAL",
 ]
 
-SAMPLE_PROFILES: Dict[str, Dict[str, Any]] = {
+SAMPLE_PROFILES: dict[str, dict[str, Any]] = {
     "clean": {
         "section_names": (".text", ".rdata", ".data"),
         "imports": (),
@@ -73,7 +73,7 @@ def _classify_severity(score: int) -> str:
     return "LOW"
 
 
-def _build_disassembly_snippet(entry_rva: int, suspicious_apis: List[str]) -> str:
+def _build_disassembly_snippet(entry_rva: int, suspicious_apis: list[str]) -> str:
     lines = [
         f"; Disassembly excerpt at EntryPoint RVA {hex(entry_rva)}",
         f"{hex(entry_rva)}: 48 89 5C 24 08       mov     qword ptr [rsp+8], rbx",
@@ -103,9 +103,9 @@ class StaticTriagePipeline:
     def triage_sample(
         self,
         profile: str = "clean",
-        custom_bytes: Optional[bytes] = None,
-    ) -> Dict[str, Any]:
-        stages_completed: List[str] = []
+        custom_bytes: bytes | None = None,
+    ) -> dict[str, Any]:
+        stages_completed: list[str] = []
 
         if custom_bytes is not None:
             raw_bytes = bytes(custom_bytes)
