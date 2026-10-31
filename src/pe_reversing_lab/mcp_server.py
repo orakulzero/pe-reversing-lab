@@ -1,34 +1,44 @@
-"""Stdio JSON-RPC 2.0 MCP Server for pe_reversing_lab."""
+"""Stdio JSON-RPC 2.0 MCP Server for pe_reversing_lab (Active Execution Engine M3.1)."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 from typing import Any
 
-SERVER_NAME = 'pe-reversing-lab-mcp'
+from pe_reversing_lab.l1_primitives import generate_yara_rule
+from pe_reversing_lab.l3_pipeline import StaticTriagePipeline
+
+SERVER_NAME = "pe-reversing-lab-mcp"
 TOOLS = [
     {
         "name": "pe_reversing_lab_triage_binary",
-        "description": "Execute pe_reversing_lab_triage_binary via pe-reversing-lab-mcp.",
+        "description": "Execute 5-stage PE32+ x86_64 static capability triage via pe-reversing-lab-mcp.",
         "inputSchema": {
             "type": "object",
-            "properties": {}
-        }
+            "properties": {
+                "profile": {"type": "string", "default": "clean"},
+            },
+        },
     },
     {
         "name": "pe_reversing_lab_generate_yara",
-        "description": "Execute pe_reversing_lab_generate_yara via pe-reversing-lab-mcp.",
+        "description": "Synthesize deterministic YARA detection rule via pe-reversing-lab-mcp.",
         "inputSchema": {
             "type": "object",
-            "properties": {}
-        }
-    }
+            "properties": {
+                "sample_sha256": {"type": "string"},
+                "suspicious_apis": {"type": "array", "items": {"type": "string"}},
+                "high_entropy": {"type": "boolean", "default": False},
+            },
+        },
+    },
 ]
 
 
 def handle_mcp_request(req: dict[str, Any]) -> dict[str, Any] | None:
-    """Process a single JSON-RPC 2.0 MCP request."""
+    """Process a single JSON-RPC 2.0 MCP request with active StaticTriagePipeline execution."""
     method = req.get("method", "")
     req_id = req.get("id")
     if method == "notifications/initialized" or req_id is None:
@@ -40,7 +50,7 @@ def handle_mcp_request(req: dict[str, Any]) -> dict[str, Any] | None:
             "result": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": SERVER_NAME, "version": "2.0.0"},
+                "serverInfo": {"name": SERVER_NAME, "version": "2.1.0"},
             },
         }
     if method == "tools/list":
@@ -49,7 +59,22 @@ def handle_mcp_request(req: dict[str, Any]) -> dict[str, Any] | None:
         params = req.get("params") or {}
         tool_name = params.get("name", "")
         args = params.get("arguments") or {}
-        payload = {"ok": True, "server": SERVER_NAME, "tool": tool_name, "arguments": args}
+        payload: dict[str, Any] = {"ok": True, "server": SERVER_NAME, "tool": tool_name, "arguments": args}
+        if tool_name == "pe_reversing_lab_triage_binary":
+            pipeline = StaticTriagePipeline()
+            dossier = pipeline.triage_sample(profile=str(args.get("profile", "clean")))
+            payload["dossier"] = dossier
+            payload["certificate_sha256"] = dossier.get("certificate_sha256") or hashlib.sha256(
+                json.dumps(dossier, sort_keys=True, default=str).encode("utf-8")
+            ).hexdigest()
+        elif tool_name == "pe_reversing_lab_generate_yara":
+            yara_text = generate_yara_rule(
+                sample_sha256=str(args.get("sample_sha256", "a" * 64)),
+                suspicious_apis=list(args.get("suspicious_apis") or ["IsDebuggerPresent"]),
+                high_entropy=bool(args.get("high_entropy", False)),
+            )
+            payload["yara_rule"] = yara_text
+            payload["certificate_sha256"] = hashlib.sha256(yara_text.encode("utf-8")).hexdigest()
         return {
             "jsonrpc": "2.0",
             "id": req_id,
