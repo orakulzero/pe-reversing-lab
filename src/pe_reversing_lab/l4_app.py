@@ -10,7 +10,7 @@ import datetime
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
@@ -48,20 +48,20 @@ class TriageRequest(BaseModel):
 class YaraGenerateRequest(BaseModel):
     rule_name: str = "custom_pe64_rule"
     sha256: str
-    suspicious_apis: List[str] = []
+    suspicious_apis: list[str] = []
     packed: bool = False
     score: int = 80
 
 
 class ReportToRootRequest(BaseModel):
     profile: str = "packed_injector"
-    root_dir: Optional[str] = None
-    summary: Optional[str] = None
+    root_dir: str | None = None
+    summary: str | None = None
 
 
 class DisassembleRequest(BaseModel):
-    profile: Optional[str] = None
-    raw_hex: Optional[str] = None
+    profile: str | None = None
+    raw_hex: str | None = None
     base_rva: int = 0x1000
     max_instructions: int = 32
     max_bytes: int = 128
@@ -69,9 +69,9 @@ class DisassembleRequest(BaseModel):
 
 
 class SyscallScanRequest(BaseModel):
-    profile: Optional[str] = None
-    raw_hex: Optional[str] = None
-    target_path: Optional[str] = None
+    profile: str | None = None
+    raw_hex: str | None = None
+    target_path: str | None = None
 
 
 def _render_workstation_html() -> str:
@@ -177,7 +177,7 @@ async def get_workstation_ui() -> HTMLResponse:
 
 
 @app.get("/api/pe/catalog")
-async def get_pe_catalog() -> Dict[str, Any]:
+async def get_pe_catalog() -> dict[str, Any]:
     """Return the suspicious API catalog, sample profiles, and entropy threshold."""
     return {
         "ok": True,
@@ -189,7 +189,7 @@ async def get_pe_catalog() -> Dict[str, Any]:
 
 
 @app.post("/api/pe/triage")
-async def run_pe_triage(req: TriageRequest) -> Dict[str, Any]:
+async def run_pe_triage(req: TriageRequest) -> dict[str, Any]:
     """Execute the 5-stage StaticTriagePipeline on the requested profile."""
     try:
         return _PIPELINE.triage_sample(profile=req.profile)
@@ -198,7 +198,7 @@ async def run_pe_triage(req: TriageRequest) -> Dict[str, Any]:
 
 
 @app.post("/api/pe/yara")
-async def create_yara_signature(req: YaraGenerateRequest) -> Dict[str, Any]:
+async def create_yara_signature(req: YaraGenerateRequest) -> dict[str, Any]:
     """Generate a YARA rule from static indicators."""
     try:
         rule_text = generate_yara_rule(
@@ -218,7 +218,7 @@ async def create_yara_signature(req: YaraGenerateRequest) -> Dict[str, Any]:
 
 
 @app.post("/api/pe/report-to-root")
-async def report_to_root_endpoint(req: ReportToRootRequest) -> Dict[str, Any]:
+async def report_to_root_endpoint(req: ReportToRootRequest) -> dict[str, Any]:
     """Write structured JSONL and Markdown telemetry to the Root Architecture Session brain dir."""
     root_conv_id = "a6e93033-0846-422c-a4e2-dfc7274efe0d"
     if req.root_dir:
@@ -286,7 +286,7 @@ async def report_to_root_endpoint(req: ReportToRootRequest) -> Dict[str, Any]:
 
 
 @app.post("/api/pe/disassemble")
-async def disassemble_pe_endpoint(req: DisassembleRequest) -> Dict[str, Any]:
+async def disassemble_pe_endpoint(req: DisassembleRequest) -> dict[str, Any]:
     """Disassemble function prologue or raw instruction bytes."""
     try:
         if req.raw_hex:
@@ -334,7 +334,7 @@ async def disassemble_pe_endpoint(req: DisassembleRequest) -> Dict[str, Any]:
 
 
 @app.post("/api/pe/syscalls")
-async def scan_syscalls_endpoint(req: SyscallScanRequest) -> Dict[str, Any]:
+async def scan_syscalls_endpoint(req: SyscallScanRequest) -> dict[str, Any]:
     """Scan executable sections and export tables for direct, hooked, or indirect syscall stubs."""
     try:
         if req.target_path:
