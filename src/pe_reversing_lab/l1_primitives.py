@@ -14,9 +14,10 @@ import hashlib
 import math
 import re
 import struct
-from typing import Any, Dict, Iterable, List, Sequence, Tuple
+from typing import Any
+from collections.abc import Iterable, Sequence
 
-SUSPICIOUS_API_CATALOG: Dict[str, Dict[str, Any]] = {
+SUSPICIOUS_API_CATALOG: dict[str, dict[str, Any]] = {
     "IsDebuggerPresent": {
         "category": "anti_debug",
         "severity_weight": 20,
@@ -101,12 +102,12 @@ def is_packed_entropy(entropy: float, threshold: float = 7.0) -> bool:
     return float(entropy) >= float(threshold)
 
 
-def parse_rich_header(data: bytes, e_lfanew: int) -> Dict[str, Any]:
+def parse_rich_header(data: bytes, e_lfanew: int) -> dict[str, Any]:
     """
     Search DOS stub (0x40..e_lfanew) for b'Rich' marker, extract XOR key,
     locate b'DanS', and decode @comp.id compiler/linker records.
     """
-    empty_result: Dict[str, Any] = {
+    empty_result: dict[str, Any] = {
         "present": False,
         "xor_key": "0x0",
         "dans_offset": 0,
@@ -147,7 +148,7 @@ def parse_rich_header(data: bytes, e_lfanew: int) -> Dict[str, Any]:
         val = struct.unpack_from("<I", data, off)[0] ^ xor_key
         decrypted.extend(struct.pack("<I", val))
 
-    records: List[Dict[str, int]] = []
+    records: list[dict[str, int]] = []
     # After DanS (4 bytes) + 3 zero padding DWORDs (12 bytes) = 16 bytes:
     for i in range(16, len(decrypted), 8):
         if i + 8 <= len(decrypted):
@@ -176,13 +177,13 @@ def parse_rich_header(data: bytes, e_lfanew: int) -> Dict[str, Any]:
 def parse_export_directory(
     data: bytes,
     opt_offset: int,
-    sections: List[Dict[str, Any]],
-) -> Dict[str, Any]:
+    sections: list[dict[str, Any]],
+) -> dict[str, Any]:
     """
     Parse IMAGE_DIRECTORY_ENTRY_EXPORT (index 0) from DataDirectory at opt_offset + 112.
     Translates RVAs using section table and extracts exported function names, ordinals, and RVAs.
     """
-    empty_result: Dict[str, Any] = {
+    empty_result: dict[str, Any] = {
         "present": False,
         "export_rva": 0,
         "export_size": 0,
@@ -240,7 +241,7 @@ def parse_export_directory(
     ords_off = rva_to_offset(addr_ords_rva)
     funcs_off = rva_to_offset(addr_funcs_rva)
 
-    exports: List[Dict[str, Any]] = []
+    exports: list[dict[str, Any]] = []
     if names_off is not None and ords_off is not None and funcs_off is not None:
         count_to_parse = min(int(num_names), 5000)
         for i in range(count_to_parse):
@@ -275,13 +276,13 @@ def parse_tls_directory(
     data: bytes,
     opt_offset: int,
     image_base: int,
-    sections: List[Dict[str, Any]],
-) -> Dict[str, Any]:
+    sections: list[dict[str, Any]],
+) -> dict[str, Any]:
     """
     Parse IMAGE_DIRECTORY_ENTRY_TLS (index 9) from DataDirectory at opt_offset + 184.
     Extracts IMAGE_TLS_DIRECTORY64 and walks the null-terminated array of callback VAs.
     """
-    empty_result: Dict[str, Any] = {
+    empty_result: dict[str, Any] = {
         "present": False,
         "tls_rva": 0,
         "tls_size": 0,
@@ -319,7 +320,7 @@ def parse_tls_directory(
     _start_va, _end_va, _index_va, callbacks_va, _zero_fill, _chars = struct.unpack_from(
         "<QQQQII", data, tls_off
     )
-    callbacks: List[Dict[str, str]] = []
+    callbacks: list[dict[str, str]] = []
     if callbacks_va != 0:
         cb_rva = callbacks_va - image_base
         cb_off = rva_to_offset(cb_rva)
@@ -347,8 +348,8 @@ def parse_tls_directory(
 
 def detect_trailing_overlay(
     data: bytes,
-    sections: List[Dict[str, Any]],
-) -> Dict[str, Any]:
+    sections: list[dict[str, Any]],
+) -> dict[str, Any]:
     """
     Calculate maximum raw section end. If len(data) > max_section_end, extract
     overlay bytes, Shannon entropy, and SHA-256.
@@ -389,17 +390,14 @@ def detect_trailing_overlay(
     }
 
 
-def detect_rwx_sections(sections: List[Dict[str, Any]]) -> Dict[str, Any]:
+def detect_rwx_sections(sections: list[dict[str, Any]]) -> dict[str, Any]:
     """
     Inspect characteristics of all sections for IMAGE_SCN_MEM_WRITE | IMAGE_SCN_MEM_EXECUTE (0xA0000000).
     """
-    rwx_sections: List[str] = []
+    rwx_sections: list[str] = []
     for sec in sections:
         raw_chars = sec.get("characteristics", "0x0")
-        if isinstance(raw_chars, str):
-            chars_val = int(raw_chars, 16)
-        else:
-            chars_val = int(raw_chars)
+        chars_val = int(raw_chars, 16) if isinstance(raw_chars, str) else int(raw_chars)
         if (chars_val & 0xA0000000) == 0xA0000000:
             rwx_sections.append(sec.get("name", ""))
 
@@ -498,7 +496,7 @@ def synthesize_pe64_sample(
     raw_offset = ((headers_end + 0x1FF) // 0x200) * 0x200
 
     section_headers = bytearray()
-    section_blobs: List[bytes] = []
+    section_blobs: list[bytes] = []
     current_raw_ptr = raw_offset
 
     import_blob = b"KERNEL32.dll\x00ntdll.dll\x00USER32.dll\x00" + b"\x00".join(
@@ -599,7 +597,7 @@ def synthesize_pe64_sample(
     return base_pe
 
 
-def parse_pe64_binary(data: bytes) -> Dict[str, Any]:
+def parse_pe64_binary(data: bytes) -> dict[str, Any]:
     """
     Parse a PE32+ x86_64 binary buffer, extracting COFF/OptionalHeader fields,
     per-section Shannon entropy, packing indicators, and suspicious IAT capabilities.
@@ -643,7 +641,7 @@ def parse_pe64_binary(data: bytes) -> Dict[str, Any]:
     )
 
     sec_table_offset = opt_offset + opt_hdr_size
-    sections: List[Dict[str, Any]] = []
+    sections: list[dict[str, Any]] = []
     any_section_packed = False
 
     for idx in range(num_sections):
@@ -684,8 +682,8 @@ def parse_pe64_binary(data: bytes) -> Dict[str, Any]:
     overall_entropy = compute_shannon_entropy(raw)
     packed = bool(any_section_packed or is_packed_entropy(overall_entropy))
 
-    suspicious_apis: List[str] = []
-    capabilities: List[Dict[str, Any]] = []
+    suspicious_apis: list[str] = []
+    capabilities: list[dict[str, Any]] = []
     for api_name, meta in SUSPICIOUS_API_CATALOG.items():
         if api_name.encode("ascii") in raw:
             suspicious_apis.append(api_name)
@@ -809,7 +807,7 @@ def disassemble_x64_prologue(
     max_instructions: int = 32,
     max_bytes: int = 128,
     stop_on_ret: bool = True,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """
     Deterministic byte-level x86_64 prologue and stub instruction decoder.
     Decodes stack frame setup/teardown, register saves/restores, syscall setups,
@@ -819,7 +817,7 @@ def disassemble_x64_prologue(
         return []
 
     raw = bytes(data)
-    instructions: List[Dict[str, Any]] = []
+    instructions: list[dict[str, Any]] = []
     idx = 0
     limit = min(len(raw), max_bytes)
 
@@ -1240,15 +1238,15 @@ def disassemble_x64_prologue(
 
 def detect_syscall_stubs(
     data: bytes,
-    parsed_pe: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
+    parsed_pe: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
     """
     Scan executable sections and exported Nt*/Zw* functions to detect:
     - Standard / Hell's Gate direct syscall stubs (extracting SSN, RVA, symbol).
     - Hooked / Halo's Gate / Tartarus' Gate stubs (E9 inline jump at byte 0 or 3).
     - Standalone 0F 05 C3 (syscall; ret) indirect invocation gadgets.
     """
-    empty_result: Dict[str, Any] = {
+    empty_result: dict[str, Any] = {
         "stubs_detected": 0,
         "direct_stubs": [],
         "hooked_stubs": [],
@@ -1279,9 +1277,9 @@ def detect_syscall_stubs(
                 return raw_ptr + (rva - va)
         return None
 
-    direct_stubs: List[Dict[str, Any]] = []
-    hooked_stubs: List[Dict[str, Any]] = []
-    indirect_gadgets: List[Dict[str, Any]] = []
+    direct_stubs: list[dict[str, Any]] = []
+    hooked_stubs: list[dict[str, Any]] = []
+    indirect_gadgets: list[dict[str, Any]] = []
     recorded_rvas: set[int] = set()
 
     # 1. Export Directory Inspection (e.g. ntdll.dll Nt* / Zw* exports)
@@ -1463,14 +1461,14 @@ def detect_syscall_stubs(
 
 def build_iat_eat_xref_graph(
     data: bytes,
-    parsed_pe: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
+    parsed_pe: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
     """
     Walk executable sections for RIP-relative (FF 15/FF 25) and relative (E8/E9) transfers,
     correlate targets with IAT imported functions and EAT exported symbols,
     and output a structured dependency graph.
     """
-    empty_result: Dict[str, Any] = {
+    empty_result: dict[str, Any] = {
         "nodes": [],
         "edges": [],
         "iat_xref_count": 0,
@@ -1499,7 +1497,7 @@ def build_iat_eat_xref_graph(
         return None
 
     # 1. Resolve EAT symbols
-    eat_map: Dict[int, str] = {}
+    eat_map: dict[int, str] = {}
     for exp in parsed_pe.get("exports", {}).get("exports", []):
         fn_name = exp.get("name", "")
         rva_val = exp.get("rva", 0)
@@ -1508,7 +1506,7 @@ def build_iat_eat_xref_graph(
             eat_map[rva_int] = fn_name
 
     # 2. Resolve IAT symbols (from DataDirectory[1] Import Table)
-    iat_map: Dict[int, str] = {}
+    iat_map: dict[int, str] = {}
     try:
         e_lfanew = struct.unpack_from("<I", raw, 0x3C)[0]
         opt_offset = e_lfanew + 24
@@ -1560,8 +1558,8 @@ def build_iat_eat_xref_graph(
     except Exception:
         pass
 
-    nodes_dict: Dict[str, Dict[str, Any]] = {}
-    edges: List[Dict[str, Any]] = []
+    nodes_dict: dict[str, dict[str, Any]] = {}
+    edges: list[dict[str, Any]] = []
     iat_xref_count = 0
     eat_export_count = 0
 
