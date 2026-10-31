@@ -7,12 +7,11 @@ from __future__ import annotations
 
 import argparse
 import json
-from typing import List, Optional
 
 from pe_reversing_lab.l3_pipeline import StaticTriagePipeline
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="pe-reversing-lab",
         description="Static PE32+ x86_64 Reverse Engineering, Entropy & YARA Triage CLI",
