@@ -10,11 +10,10 @@ Tier L4 Advanced Static PE32+ Reverse Engineering Algorithms (v1.3.0):
 from __future__ import annotations
 
 import hashlib
-import os
 from pathlib import Path
 import re
 import struct
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Any
 
 try:
     import pefile  # type: ignore
@@ -43,7 +42,7 @@ _MODRM_OPCODES = {
 }
 
 
-def _load_pe_bytes(pe_path_or_bytes: Union[str, bytes, Path]) -> Optional[bytes]:
+def _load_pe_bytes(pe_path_or_bytes: str | bytes | Path) -> bytes | None:
     """Safely load raw bytes from bytes, str, or Path."""
     if isinstance(pe_path_or_bytes, (bytes, bytearray)):
         return bytes(pe_path_or_bytes)
@@ -90,18 +89,18 @@ def _disassemble_x64_instructions(
     raw: bytes,
     base_rva: int,
     max_instructions: int = 5000,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Deterministic byte-level x86_64 control-flow instruction decoder."""
-    instructions: List[Dict[str, Any]] = []
+    instructions: list[dict[str, Any]] = []
     idx = 0
     limit = len(raw)
 
     while idx < limit and len(instructions) < max_instructions:
         start_idx = idx
         curr_rva = base_rva + idx
-        prefixes: List[int] = []
+        prefixes: list[int] = []
         rex = 0
-        seg_prefix: Optional[int] = None
+        seg_prefix: int | None = None
 
         while idx < limit:
             b = raw[idx]
@@ -670,17 +669,17 @@ def _disassemble_x64_instructions(
 
 
 def _build_basic_blocks(
-    instructions: List[Dict[str, Any]],
+    instructions: list[dict[str, Any]],
     entry_point_rva: int,
-) -> Tuple[List[Dict[str, Any]], int, int]:
+) -> tuple[list[dict[str, Any]], int, int]:
     """Segment instructions into basic blocks and compute cyclomatic complexity."""
     if not instructions:
         return [], 0, 0
 
-    all_rvas: List[int] = [instr["rva"] for instr in instructions]
-    rva_set: Set[int] = set(all_rvas)
+    all_rvas: list[int] = [instr["rva"] for instr in instructions]
+    rva_set: set[int] = set(all_rvas)
 
-    leaders: Set[int] = set()
+    leaders: set[int] = set()
     leaders.add(all_rvas[0])
 
     if entry_point_rva in rva_set:
@@ -700,8 +699,8 @@ def _build_basic_blocks(
                 if next_rva in rva_set:
                     leaders.add(next_rva)
 
-    blocks: List[Dict[str, Any]] = []
-    current_block_instrs: List[Dict[str, Any]] = []
+    blocks: list[dict[str, Any]] = []
+    current_block_instrs: list[dict[str, Any]] = []
     block_id_counter = 0
 
     for instr in instructions:
@@ -782,7 +781,7 @@ def _build_basic_blocks(
     total_edges = 0
 
     for block in blocks:
-        successors: List[int] = []
+        successors: list[int] = []
         term = block["terminator"]
         is_cond = term["is_conditional"]
         target = term["target_rva"]
@@ -811,17 +810,14 @@ def _build_basic_blocks(
         total_edges += len(unique_successors)
 
     n_blocks = len(blocks)
-    if n_blocks == 0:
-        complexity = 0
-    else:
-        complexity = max(1, total_edges - n_blocks + 2)
+    complexity = 0 if n_blocks == 0 else max(1, total_edges - n_blocks + 2)
 
     return blocks, total_edges, complexity
 
 
-def _scan_for_peb_walk_shellcode(raw_bytes: bytes, sections: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _scan_for_peb_walk_shellcode(raw_bytes: bytes, sections: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Scan raw binary and sections for GS:[0x60] PEB-walk shellcode sequences."""
-    matches: List[Dict[str, Any]] = []
+    matches: list[dict[str, Any]] = []
 
     def rva_from_offset(offset: int) -> int:
         for s in sections:
@@ -873,9 +869,9 @@ def _scan_for_peb_walk_shellcode(raw_bytes: bytes, sections: List[Dict[str, Any]
     return matches
 
 
-def _scan_for_indirect_transfers(raw_bytes: bytes, sections: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _scan_for_indirect_transfers(raw_bytes: bytes, sections: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Scan raw binary for register-indirect calls and jumps."""
-    transfers: List[Dict[str, Any]] = []
+    transfers: list[dict[str, Any]] = []
 
     def rva_from_offset(offset: int) -> int:
         for s in sections:
@@ -975,12 +971,12 @@ def _scan_for_indirect_transfers(raw_bytes: bytes, sections: List[Dict[str, Any]
     return transfers
 
 
-def _calculate_pure_imphash(raw_bytes: bytes, sections: List[Dict[str, Any]], import_rva: int) -> str:
+def _calculate_pure_imphash(raw_bytes: bytes, sections: list[dict[str, Any]], import_rva: int) -> str:
     """Pure Python Mandiant ImpHash implementation without external dependencies."""
     if import_rva == 0:
         return ""
 
-    def rva_to_offset(rva: int) -> Optional[int]:
+    def rva_to_offset(rva: int) -> int | None:
         for s in sections:
             va = s.get("va", s.get("virtual_address", 0))
             vsz = s.get("virtual_size", 0) or s.get("raw_size", 0)
@@ -993,7 +989,7 @@ def _calculate_pure_imphash(raw_bytes: bytes, sections: List[Dict[str, Any]], im
     if desc_offset is None or desc_offset >= len(raw_bytes):
         return ""
 
-    symbols: List[str] = []
+    symbols: list[str] = []
     idx = desc_offset
 
     while idx + 20 <= len(raw_bytes):
@@ -1045,7 +1041,7 @@ def _calculate_pure_imphash(raw_bytes: bytes, sections: List[Dict[str, Any]], im
     return hashlib.md5(joined.encode("ascii")).hexdigest()
 
 
-def _extract_synthetic_import_symbols(raw_bytes: bytes) -> List[str]:
+def _extract_synthetic_import_symbols(raw_bytes: bytes) -> list[str]:
     """Heuristic import symbol extractor for synthetic PE test fixtures."""
     marker = b"USER32.dll\x00"
     idx = raw_bytes.find(marker)
@@ -1053,7 +1049,7 @@ def _extract_synthetic_import_symbols(raw_bytes: bytes) -> List[str]:
         return []
 
     rest = raw_bytes[idx + len(marker):].split(b"\x00")
-    symbols: List[str] = []
+    symbols: list[str] = []
     for s in rest:
         try:
             txt = s.decode("ascii").strip().lower()
@@ -1064,7 +1060,7 @@ def _extract_synthetic_import_symbols(raw_bytes: bytes) -> List[str]:
     return symbols
 
 
-def compute_pe_imphash(pe_path_or_bytes: Union[str, bytes, Path]) -> str:
+def compute_pe_imphash(pe_path_or_bytes: str | bytes | Path) -> str:
     """Compute Mandiant import hash for a PE32+ binary with pure-Python fallback.
 
     Normalizes module and function names to lowercase and computes MD5.
@@ -1105,7 +1101,7 @@ def compute_pe_imphash(pe_path_or_bytes: Union[str, bytes, Path]) -> str:
                     import_rva = struct.unpack_from("<I", raw_bytes, import_dir_entry_offset)[0]
 
     sec_headers_offset = opt_offset + size_opt_header
-    sections: List[Dict[str, Any]] = []
+    sections: list[dict[str, Any]] = []
     for i in range(num_sections):
         s_off = sec_headers_offset + (i * 40)
         if s_off + 40 > len(raw_bytes):
@@ -1134,13 +1130,13 @@ def compute_pe_imphash(pe_path_or_bytes: Union[str, bytes, Path]) -> str:
     return ""
 
 
-def parse_pe_rich_header(data_or_path: Union[str, bytes, Path], e_lfanew: int = 0) -> Dict[str, Any]:
+def parse_pe_rich_header(data_or_path: str | bytes | Path, e_lfanew: int = 0) -> dict[str, Any]:
     """Decode Microsoft Rich header via DanS (0x536E6144) marker and XOR key.
 
     Returns dictionary with present/valid status, xor_key, and compiler records.
     """
     raw_bytes = _load_pe_bytes(data_or_path)
-    empty_result: Dict[str, Any] = {
+    empty_result: dict[str, Any] = {
         "valid": False,
         "present": False,
         "xor_key": "0x0",
@@ -1187,9 +1183,9 @@ def parse_pe_rich_header(data_or_path: Union[str, bytes, Path], e_lfanew: int = 
 
 
 def analyze_pe_cfg_and_trampolines(
-    pe_path_or_bytes: Union[str, bytes, Path],
+    pe_path_or_bytes: str | bytes | Path,
     max_instructions: int = 5000,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Analyze PE32+ executable, construct CFG basic blocks, compute Mandiant ImpHash,
     and scan for GS:[0x60] PEB-walk shellcode and register-indirect trampolines.
     """
@@ -1262,8 +1258,8 @@ def analyze_pe_cfg_and_trampolines(
         entry_point_rva = struct.unpack_from("<I", raw_bytes, opt_offset + 16)[0]
 
     sec_headers_offset = opt_offset + size_opt_header
-    sections: List[Dict[str, Any]] = []
-    text_section: Optional[Dict[str, Any]] = None
+    sections: list[dict[str, Any]] = []
+    text_section: dict[str, Any] | None = None
 
     for i in range(num_sections):
         s_off = sec_headers_offset + (i * 40)
@@ -1285,9 +1281,7 @@ def analyze_pe_cfg_and_trampolines(
         }
         sections.append(sec_dict)
 
-        if s_name.lower() == ".text":
-            text_section = sec_dict
-        elif text_section is None and sec_dict["is_executable"]:
+        if s_name.lower() == ".text" or text_section is None and sec_dict["is_executable"]:
             text_section = sec_dict
 
     # 1. ImpHash
@@ -1356,8 +1350,8 @@ def analyze_pe_cfg_and_trampolines(
 
 
 def analyze_pe_security_and_unwind(
-    pe_path_or_bytes: Union[str, bytes, Path],
-) -> Dict[str, Any]:
+    pe_path_or_bytes: str | bytes | Path,
+) -> dict[str, Any]:
     """Tier L4 Authenticode WIN_CERTIFICATE, EAT Export Forwarding & .pdata x64 Exception Unwind (v2.0.0).
 
     Parses:
@@ -1428,7 +1422,7 @@ def analyze_pe_security_and_unwind(
 
     # Parse Section Headers
     sec_headers_off = opt_off + size_of_opt_hdr
-    sections: List[Dict[str, Any]] = []
+    sections: list[dict[str, Any]] = []
     for s_idx in range(num_sections):
         sh_off = sec_headers_off + s_idx * 40
         if sh_off + 40 > file_size:
@@ -1446,7 +1440,7 @@ def analyze_pe_security_and_unwind(
             "characteristics": s_chars,
         })
 
-    def rva_to_offset(rva: int) -> Optional[int]:
+    def rva_to_offset(rva: int) -> int | None:
         for sec in sections:
             va = sec["virtual_address"]
             span = max(sec["virtual_size"], sec["raw_size"])
@@ -1463,7 +1457,7 @@ def analyze_pe_security_and_unwind(
     if num_dd > 4 and dd_base + 4 * 8 + 8 <= file_size:
         sec_dir_file_off, sec_dir_size = struct.unpack_from("<II", raw_bytes, dd_base + 4 * 8)
 
-    certificates: List[Dict[str, Any]] = []
+    certificates: list[dict[str, Any]] = []
     if sec_dir_file_off != 0 and sec_dir_size > 0:
         curr_off = sec_dir_file_off
         end_off = min(sec_dir_file_off + sec_dir_size, file_size)
@@ -1506,7 +1500,7 @@ def analyze_pe_security_and_unwind(
 
         unverified_overlay = max(0, file_size - (sec_dir_file_off + sec_dir_size))
         tamper_detected = False
-        tamper_reasons: List[str] = []
+        tamper_reasons: list[str] = []
         if unverified_overlay > 0:
             tamper_detected = True
             tamper_reasons.append(f"Unverified trailing overlay of {unverified_overlay} bytes after certificate")
@@ -1554,8 +1548,8 @@ def analyze_pe_security_and_unwind(
     if num_dd > 0 and dd_base + 8 <= file_size:
         exp_rva, exp_size = struct.unpack_from("<II", raw_bytes, dd_base)
 
-    forwarders: List[Dict[str, Any]] = []
-    all_exports: List[Dict[str, Any]] = []
+    forwarders: list[dict[str, Any]] = []
+    all_exports: list[dict[str, Any]] = []
     num_funcs = 0
 
     if exp_rva != 0 and exp_size > 0:
@@ -1571,7 +1565,7 @@ def analyze_pe_security_and_unwind(
             names_off = rva_to_offset(addr_names_rva)
             ords_off = rva_to_offset(addr_ords_rva)
 
-            ord_to_name: Dict[int, str] = {}
+            ord_to_name: dict[int, str] = {}
             if names_off is not None and ords_off is not None:
                 for n_idx in range(min(num_names, 20000)):
                     if names_off + n_idx * 4 + 4 > file_size or ords_off + n_idx * 2 + 2 > file_size:
@@ -1641,7 +1635,7 @@ def analyze_pe_security_and_unwind(
     if num_dd > 3 and dd_base + 3 * 8 + 8 <= file_size:
         exc_rva, exc_size = struct.unpack_from("<II", raw_bytes, dd_base + 3 * 8)
 
-    runtime_functions: List[Dict[str, Any]] = []
+    runtime_functions: list[dict[str, Any]] = []
     if exc_rva != 0 and exc_size >= 12:
         exc_off = rva_to_offset(exc_rva)
         if exc_off is not None and exc_off < file_size:
@@ -1663,7 +1657,7 @@ def analyze_pe_security_and_unwind(
                     frame_reg = frame_byte & 0x0F
                     frame_off = (frame_byte >> 4) & 0x0F
 
-                    flag_names: List[str] = []
+                    flag_names: list[str] = []
                     if flags == 0:
                         flag_names.append("UNW_FLAG_NHANDLER")
                     if flags & 0x01:
@@ -1673,7 +1667,7 @@ def analyze_pe_security_and_unwind(
                     if flags & 0x04:
                         flag_names.append("UNW_FLAG_CHAININFO")
 
-                    parsed_codes: List[Dict[str, Any]] = []
+                    parsed_codes: list[dict[str, Any]] = []
                     codes_base = ui_off + 4
                     op_names = {
                         0: "UWOP_PUSH_NONVOL",
