@@ -22,6 +22,10 @@ from pe_reversing_lab.l1_primitives import (
     synthesize_pe64_sample,
 )
 from pe_reversing_lab.l3_pipeline import StaticTriagePipeline
+from pe_reversing_lab.local_ipc_packet_sniffer import (
+    LocalIpcPacketSniffer,
+    inspect_ipc_packet,
+)
 from pe_reversing_lab.pe64_imphash_iat_guard import (
     PE64ImpHashIATGuard,
     audit_pe64_import_integrity,
@@ -30,6 +34,7 @@ from pe_reversing_lab.pe64_imphash_iat_guard import (
 )
 
 __all__ = [
+    "LocalIpcPacketSniffer",
     "PE64ImpHashIATGuard",
     "SUSPICIOUS_API_CATALOG",
     "StaticTriagePipeline",
@@ -44,9 +49,11 @@ __all__ = [
     "detect_syscall_stubs",
     "disassemble_x64_prologue",
     "generate_yara_rule",
+    "inspect_ipc_packet",
     "is_packed_entropy",
     "parse_pe64_binary",
     "parse_pe_rich_header",
     "synthesize_pe64_sample",
 ]
 __version__ = "2.0.0"
+__v3_generation__ = "3.0.0"
