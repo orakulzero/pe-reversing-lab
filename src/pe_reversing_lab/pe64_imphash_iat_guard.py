@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import hashlib
-from typing import Any, Sequence
+from typing import Any
+from collections.abc import Sequence
 
 STRIPPED_EXTENSIONS: tuple[str, ...] = (".dll", ".sys", ".ocx", ".drv", ".cpl", ".exe")
 
